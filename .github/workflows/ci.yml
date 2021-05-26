@@ -1,0 +1,155 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - '*'
+    paths-ignore:
+      - 'example/**'
+      - 'benchmarks/**'
+      - '**/*.md'
+      - 'appveyor.xml'
+      - '.travis.yml'
+  pull_request:
+    branches:
+      - '*'
+    paths-ignore:
+      - 'example/**'
+      - 'benchmarks/**'
+      - '**/*.md'
+      - 'appveyor.xml'
+      - '.travis.yml'
+
+jobs:
+  matrix_prep:
+    name: Matrix Preparation
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    env:
+      # Script as an environment variable so we don't have to worry shell substitions
+      MATRIX_GENERATION_NODE_JS_SCRIPT: |
+        const https = require('https');
+        const download = (url) => new Promise((resolve, reject) => {
+            https.get(url, (res) => {
+                const { statusCode } = res;
+                if (statusCode !== 200) {
+                    return reject(new Error(`Request failed with status: ${statusCode}`));
+                }
+                const contentType = res.headers['content-type'];
+                if (!/^application\/json/.test(contentType)) {
+                    return reject(new Error(`Invalid content-type: ${contentType}`));
+                }
+                res.setEncoding('utf8');
+                let data = '';
+                res.on('data', (chunk) => {
+                    data += chunk;
+                });
+                res.on('end', () => resolve(data));
+            }).on('error', (err) => reject(err));
+        });
+
+        async function main() {
+            const json = await download('https://nodejs.org/download/release/index.json');
+            const versions = JSON.parse(json);
+
+            // "v10.20.30" => 10
+            const latestMajor = Number(versions[0].version.split(/v|\./)[1]);
+
+            // Start with hard-coded ancient versions
+            const list = [
+                '0.10',
+                '0.12',
+            ];
+            // Then add from v4 up to latest major
+            for (let i = 4; i < latestMajor; i++) {
+                list.push('' + i);
+            }
+
+            const include = list.map((node_version) => ({
+                os: 'ubuntu-latest',
+                name: `Node v${node_version}`,
+                node_version,
+            }));
+
+            console.log('::set-output name=matrix::%j', { include });
+        }
+        main().then(() => {
+            process.exit(0);
+        }).catch((err) => {
+            console.error('%s', err.stack);
+            process.exit(1);
+        });
+    steps:
+    - id: set-matrix
+      run: |
+        node -e "${MATRIX_GENERATION_NODE_JS_SCRIPT}"
+
+  test:
+    name: '${{ matrix.name }}'
+    runs-on: ${{ matrix.os }}
+    needs: matrix_prep
+    strategy:
+      fail-fast: false
+      matrix:
+        ${{fromJson(needs.matrix_prep.outputs.matrix)}}
+    env:
+      ACTIONS_STEP_DEBUG: true
+      ACTIONS_RUNNER_DEBUG: true
+    steps:
+    - name: Show Matrix
+      env:
+        MATRIX_JSON: ${{ toJSON(matrix) }}
+      run: echo "${MATRIX_JSON}"
+    - name: Checkout
+      uses: actions/checkout@v2
+      with:
+        fetch-depth: 50
+    - name: Install Node ${{ matrix.node_version }}
+      uses: actions/setup-node@v2
+      with:
+        node-version: ${{ matrix.node_version }}
+    - name: Show Node version
+      run: node --version
+    - name: Disable shrinkwrap and lock
+      run: npm config set shrinkwrap false
+    - name: Remove non-test dependencies
+      run: npm rm --silent --save-dev connect-redis
+    - name: Install version-specific dependencies
+      run: |
+        node_version=$(node --version | tail -c +2)
+        # mocha for testing 
+        if [[ "$(cut -d. -f1 <<< "${node_version}")" -lt 4 ]]; then
+          # - use 3.x for Node.js < 4
+          npm install --silent --save-dev mocha@3.5.3
+        elif [[ "$(cut -d. -f1 <<< "${node_version}")" -lt 6 ]]; then
+          # - use 5.x for Node.js < 6
+          npm install --silent --save-dev mocha@5.2.0
+        elif [[ "$(cut -d. -f1 <<< "${node_version}")" -lt 8 ]]; then
+          # - use 6.x for Node.js < 8
+          npm install --silent --save-dev mocha@6.2.2
+        elif [[ "$(cut -d. -f1 <<< "${node_version}")" -lt 10 ]]; then
+          # - use 7.x for Node.js < 10
+          npm install --silent --save-dev mocha@7.2.0
+        fi
+        # supertest for http calls
+        if [[ "$(cut -d. -f1 <<< "$TRAVIS_NODE_VERSION")" -lt 4 ]]; then
+          # - use 2.0.0 for Node.js < 4
+          npm install --silent --save-dev supertest@2.0.0
+        elif [[ "$(cut -d. -f1 <<< "$TRAVIS_NODE_VERSION")" -lt 6 ]]; then
+          # - use 3.4.2 for Node.js < 6
+          npm install --silent --save-dev supertest@3.4.2
+        fi
+    - name: Update node modules
+      run: |
+        npm install
+        npm prune
+        npm rebuild
+    - name: Test
+      run: npm run test-ci
+    - name: Lint
+      run: npm run lint
+    - name: Upload coverage
+      uses: coverallsapp/github-action@8cbef1dea373ebce56de0a14c68d6267baa10b44
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
